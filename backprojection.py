@@ -2,28 +2,41 @@
 Back projection module for LabDataSet objects.
 """
 
-import lab_data_set as lds
 import matplotlib.pyplot as plt
 import obspy
+from obspy.signal import cross_correlation
 import numpy as np
 from scipy import signal  # for filtering
 import glob
 import time
 
+# Add paths to my other modules
+import sys
+import os
+
+_home = os.path.expanduser("~") + "/"
+for d in os.listdir(_home + "git_repos"):
+    sys.path.append(_home + "git_repos/" + d)
+
+import lab_data_set as lds
+
 
 def apply(ds: lds.LabDataSet, BP_func, tag, trace_num, **kwargs):
     """Apply a BP_func (taking kwargs, returning a stack) to (tag,trcnum) in the LDS.
     Save resulting stack in aux data under 'BP/BP_func/tag/trcnum/timestamp', with input parameters in the aux data parameters dict.
+    Report elapsed time.
     """
+    start_timer = time.perf_counter()
     stack = BP_func(ds, tag, trace_num, **kwargs)
     aux_path = "{}/{}/tr{}/{}".format(BP_func.__name__, tag, trace_num, timestamp())
     ds.add_auxiliary_data(data=stack, data_type="BP", path=aux_path, parameters=kwargs)
+    end_timer = time.perf_counter()
+    print(f"BP grid computed in {end_timer-start_timer} seconds")
+    return aux_path
 
 
-def makeframes(
-    ds: lds.LabDataSet, aux_path, tag, trace_num, dt, win_len, view_to, pre=0
-):
-    stack = ds.auxiliary_data["BP/" + aux_path][tag][f"tr{trace_num}"].data
+def makeframes(ds: lds.LabDataSet, aux_path, tstamp, dt, win_len, view_to, pre=0):
+    stack = ds.auxiliary_data["BP/" + aux_path][tstamp].data
     base_rg = np.arange(0, view_to + dt + pre, dt)
     win_list = zip(base_rg, base_rg + win_len)
 
@@ -34,15 +47,13 @@ def makeframes(
     return frames
 
 
-def frames_by_quarters(
-    ds: lds.LabDataSet, aux_path, tag, trace_num, base_pts: int, pre=0
-):
+def frames_by_quarters(ds: lds.LabDataSet, aux_path, tstamp, base_pts: int, pre=0):
     """Make and return BP frame images for a BP stack, setting frame parameters
     based on base_pts."""
     win_len = int(base_pts / 4)
     step_len = int(win_len / 4)
     view_to = int(base_pts * 1.5)
-    return makeframes(ds, aux_path, tag, trace_num, step_len, win_len, view_to, pre)
+    return makeframes(ds, aux_path, tstamp, step_len, win_len, view_to, pre)
 
 
 def get_frames_range(frames):
@@ -70,7 +81,8 @@ def show_frames(frames, minmax):
 
 
 ######## BP_funcs ########
-def BP_xcorr(ds: lds.LabDataSet,
+def BP_xcorr(
+    ds: lds.LabDataSet,
     tag,
     trace_num,
     dxy,
@@ -80,12 +92,87 @@ def BP_xcorr(ds: lds.LabDataSet,
     vp=0.272,
     vel=0,
     filt=False,
-    ):
+    no_shift=False,
+    no_weights=False,
+):
     """Use cross correlation to define weighting and polarity."""
     # set up from BP_core
     x_pts, y_pts, grid_stack, orgxy, picked_stns, trc_dict = BP_core(
         ds, tag, trace_num, dxy, grid_rg_x, grid_rg_y
     )
+    # cross-correlate to first arrival, get weight and shift for each trace
+    # get very short, pick-windowed traces for this part
+    trs_pre = 200
+    trs = ds.get_traces(tag, trace_num, pre=trs_pre, tot_len=600)
+    pks = ds.get_picks(tag, trace_num)
+    seq = sorted(picked_stns, key=lambda s: pks[s][0])
+    # find the best xcorr window for this data
+    post_lens = np.arange(150, 400, 50)
+    xcorr_start = trs_pre - 100
+    ncomp = 0  # arrival-sorted stn to use as reference trace
+    astn = seq.pop(ncomp)  # get stn to autocorrelate
+    # local functions for running xcorr and checking spread
+    def run_xcorr(post):
+        cut = slice(xcorr_start, trs_pre + post)
+        azd = trs[astn][cut] - trs[astn][xcorr_start]  # zero the trace
+        acorr = signal.correlate(azd, azd, mode="same")
+        sh, aval = cross_correlation.xcorr_max(acorr)
+        weights = {astn: 1}
+        shifts = {astn: 0}
+        for stn in seq:
+            szd = trs[stn][cut] - trs[stn][xcorr_start]
+            xcorr = signal.correlate(azd, szd, mode="same")
+            sh, cval = cross_correlation.xcorr_max(xcorr)
+            shifts[stn] = int(sh)
+            sh_cut = slice(max(cut.start - int(sh), 0), cut.stop - int(sh))
+            weights[stn] = aval / cval
+        return weights, shifts
+
+    def check_spread(weights, shifts, post, plot_trs=False):
+        cut = slice(xcorr_start, trs_pre + post)
+        xc_trs = {astn: trs[astn][cut]}
+        for stn in seq:
+            sh_cut = slice(max(cut.start - shifts[stn], 0), cut.stop - shifts[stn])
+            adj = weights[stn] * trs[stn][sh_cut]
+            xc_trs[stn] = adj - adj[0]
+        # check spread of adjusted traces
+        check = np.min(xc_trs[astn]) / 2
+        hits = [
+            np.argwhere(xc_trs[astn] < check)[0][0]
+        ]  # TODO: very written for ball drop, probably force all polarities positive and flip this inequality in future
+        for stn in seq:
+            hits.append(np.argwhere(xc_trs[stn] < check)[0][0])
+        hits.sort()
+        spread = hits[-1] - hits[0]
+        if plot_trs:
+            plt.plot(xc_trs[astn])
+            for stn in seq:
+                plt.plot(xc_trs[stn])
+            plt.show()
+        return spread
+
+    # run xcorr over each post and check spread
+    sprds = {}
+    for post in post_lens:
+        w, s = run_xcorr(post)
+        sprds[post] = check_spread(w, s, post)
+    # find min spread
+    print(sprds)
+    best_post = min(sprds, key=sprds.get)
+
+    # get weights and shift from best post value
+    wgts, sfts = run_xcorr(best_post)
+    print(sfts)
+    w_norm = sum(wgts.values())
+    # plot xcorr traces for best_post
+    _ = check_spread(wgts, sfts, best_post, plot_trs=True)
+
+    # exploratory option to ignore weights or shifts
+    if no_shift:
+        sfts = {stn: 0 for stn in picked_stns}
+    if no_weights:
+        wgts = {stn: 1 for stn in picked_stns}
+
     # loop through points
     for i, x in enumerate(x_pts):
         for j, y in enumerate(y_pts):
@@ -95,21 +182,23 @@ def BP_xcorr(ds: lds.LabDataSet,
                 dt = (
                     np.sqrt(np.sum((loc - (orgxy + [x, y])) ** 2) + 3.85 ** 2) / vp
                 )  # us travel time
-                stack_start = int(dt * 40)
+                stack_start = (
+                    int(dt * 40) - sfts[stn]
+                )  # added shift correction from xcorr
                 # stack from P wave
                 if vel:
-                    grid_stack[i, j, :] += np.diff(
+                    grid_stack[i, j, :] += wgts[stn] * np.diff(
                         trc_dict[stn][stack_start : stack_start + 2049]
                     )
                 else:
-                    grid_stack[i, j, :] += trc_dict[stn][
-                        stack_start : stack_start + 2048
-                    ]
+                    grid_stack[i, j, :] += (
+                        wgts[stn] * trc_dict[stn][stack_start : stack_start + 2048]
+                    )
 
             if filt:  # apply optional filter
                 grid_stack[i, j, :] = signal.filtfilt(*filt, grid_stack[i, j, :])
     # return grid stack for processing
-    return grid_stack
+    return grid_stack * (1 / w_norm)
 
 
 def BP_withpre(
